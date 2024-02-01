@@ -28,6 +28,7 @@ use std::process::{self, Stdio};
 use std::str;
 use std::time::Duration;
 use std::time::{self, SystemTime};
+use tokio_util::io::ReaderStream;
 
 use crate::errors::*;
 
@@ -410,57 +411,47 @@ async fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>) -> Resu
 where
     T: CommandChild + 'static,
 {
+    use futures::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let stdin = input.and_then(|i| {
-        child.take_stdin().map(|mut stdin| async move {
-            stdin.write_all(&i).await.context("failed to write stdin")
-        })
-    });
-    let stdout = child.take_stdout();
-    let stdout = async move {
-        match stdout {
-            Some(mut stdout) => {
-                let mut buf = Vec::new();
-                stdout
-                    .read_to_end(&mut buf)
-                    .await
-                    .context("failed to read stdout")?;
-                Result::Ok(Some(buf))
+
+    if let (Some(mut stdin), Some(input)) = (child.take_stdin(), input) {
+        stdin
+            .write_all(&input)
+            .await
+            .context("failed to write stdin")?;
+    }
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    match (child.take_stdout(), child.take_stderr()) {
+        (None, None) => {}
+        (Some(mut out), None) => {
+            let _ = out
+                .read_to_end(&mut stdout)
+                .await
+                .context("failed to read stdout")?;
+        }
+        (None, Some(mut err)) => {
+            let _ = err
+                .read_to_end(&mut stderr)
+                .await
+                .context("failed to read stderr")?;
+        }
+        (Some(out), Some(err)) => {
+            let mut out_stream = ReaderStream::new(out);
+            let mut err_stream = ReaderStream::new(err);
+            loop {
+                tokio::select! {
+                    Some(chunk) = out_stream.next() => stdout.extend_from_slice(&chunk.context("failed to read chunk from stdout")?),
+                    Some(chunk) = err_stream.next() => stderr.extend_from_slice(&chunk.context("failed to read chunk from stderr")?),
+                    else => break,
+                }
             }
-            None => Ok(None),
         }
-    };
-
-    let stderr = child.take_stderr();
-    let stderr = async move {
-        match stderr {
-            Some(mut stderr) => {
-                let mut buf = Vec::new();
-                stderr
-                    .read_to_end(&mut buf)
-                    .await
-                    .context("failed to read stderr")?;
-                Result::Ok(Some(buf))
-            }
-            None => Ok(None),
-        }
-    };
-
-    // Finish writing stdin before waiting, because waiting drops stdin.
-    let status = async move {
-        if let Some(stdin) = stdin {
-            let _ = stdin.await;
-        }
-
-        child.wait().await.context("failed to wait for child")
-    };
-
-    let (status, stdout, stderr) = futures::future::try_join3(status, stdout, stderr).await?;
-
+    }
+    let status = child.wait().await.context("failed to wait for child")?;
     Ok(process::Output {
         status,
-        stdout: stdout.unwrap_or_default(),
-        stderr: stderr.unwrap_or_default(),
+        stdout,
+        stderr,
     })
 }
 
@@ -767,7 +758,7 @@ impl From<std::time::SystemTime> for Timestamp {
                     seconds = -negative_secs;
                     nanoseconds = 0;
                 } else {
-                    // For example if `system_time` was 4.3 seconds before
+                    // For example if `system_time` was 4.3 seconds before
                     // the Unix epoch we get a Duration that represents
                     // `(-4, -0.3)` but we want `(-5, +0.7)`:
                     seconds = -1 - negative_secs;
