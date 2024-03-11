@@ -601,19 +601,68 @@ pub fn storage_from_config(
             #[cfg(feature = "memcached")]
             CacheType::Memcached(config::MemcachedCacheConfig {
                 ref url,
+                ref username,
+                ref password,
                 ref expiration,
+                ref key_prefix,
             }) => {
                 debug!("Init memcached cache with url {url}");
 
-                let storage = MemcachedCache::build(url, *expiration)
-                    .map_err(|err| anyhow!("create memcached cache failed: {err:?}"))?;
+                let storage = MemcachedCache::build(
+                    url,
+                    username.as_deref(),
+                    password.as_deref(),
+                    key_prefix,
+                    *expiration,
+                )
+                .map_err(|err| anyhow!("create memcached cache failed: {err:?}"))?;
                 return Ok(Arc::new(storage));
             }
             #[cfg(feature = "redis")]
-            CacheType::Redis(config::RedisCacheConfig { ref url, ref ttl }) => {
-                debug!("Init redis cache with url {url}");
-                let storage = RedisCache::build(url, *ttl)
-                    .map_err(|err| anyhow!("create redis cache failed: {err:?}"))?;
+            CacheType::Redis(config::RedisCacheConfig {
+                ref endpoint,
+                ref cluster_endpoints,
+                ref username,
+                ref password,
+                ref db,
+                ref url,
+                ref ttl,
+                ref key_prefix,
+            }) => {
+                let storage = match (endpoint, cluster_endpoints, url) {
+                    (Some(url), None, None) => {
+                        debug!("Init redis single-node cache with url {url}");
+                        RedisCache::build_single(
+                            url,
+                            username.as_deref(),
+                            password.as_deref(),
+                            *db,
+                            key_prefix,
+                            *ttl,
+                        )
+                    }
+                    (None, Some(urls), None) => {
+                        debug!("Init redis cluster cache with urls {urls}");
+                        RedisCache::build_cluster(
+                            urls,
+                            username.as_deref(),
+                            password.as_deref(),
+                            *db,
+                            key_prefix,
+                            *ttl,
+                        )
+                    }
+                    (None, None, Some(url)) => {
+                        warn!("Init redis single-node cache from deprecated API with url {url}");
+                        if username.is_some() || password.is_some() || *db != crate::config::DEFAULT_REDIS_DB {
+                            bail!("`username`, `password` and `db` has no effect when `url` is set. Please use `endpoint` or `cluster_endpoints` for new API accessing");
+                        }
+
+                        RedisCache::build_from_url(url, key_prefix, *ttl)
+                    }
+                    _ => bail!("Only one of `endpoint`, `cluster_endpoints`, `url` must be set"),
+                }
+                .map_err(|err| anyhow!("create redis cache failed: {err:?}"))?;
                 return Ok(Arc::new(storage));
             }
             #[cfg(feature = "s3")]
@@ -669,7 +718,9 @@ pub fn storage_from_config(
                 return Ok(Arc::new(storage));
             }
             #[allow(unreachable_patterns)]
-            _ => bail!("cache type is not enabled"),
+            // if we build only with `cargo build --no-default-features`
+            // we only want to use sccache with a local cache (no remote storage)
+            _ => {}
         }
     }
 

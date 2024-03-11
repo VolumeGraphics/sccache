@@ -154,7 +154,7 @@ use self::ArgData::*;
 
 const ARCH_FLAG: &str = "-arch";
 
-// Mostly taken from https://github.com/ccache/ccache/blob/master/src/compopt.c#L32-L84
+// Mostly taken from https://github.com/ccache/ccache/blob/master/src/compopt.cpp#L52-L172
 counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-", TooHardFlag),
     flag!("--coverage", Coverage),
@@ -381,6 +381,7 @@ where
                     "cu" => Some(Language::Cuda),
                     "rs" => Some(Language::Rust),
                     "cuda" => Some(Language::Cuda),
+                    "hip" => Some(Language::Hip),
                     _ => cannot_cache!("-x"),
                 };
             }
@@ -643,7 +644,8 @@ fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
         Language::ObjectiveC => Some("objective-c"),
         Language::ObjectiveCxx => Some("objective-c++"),
         Language::Cuda => Some("cu"),
-        Language::Rust => None,          // Let the compiler decide
+        Language::Rust => None, // Let the compiler decide
+        Language::Hip => Some("hip"),
         Language::GenericHeader => None, // Let the compiler decide
     }
 }
