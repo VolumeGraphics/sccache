@@ -105,6 +105,8 @@ pub struct ParsedArguments {
     pub arch_args: Vec<OsString>,
     /// Commandline arguments for the preprocessor or the compiler that don't affect the computed hash.
     pub unhashed_args: Vec<OsString>,
+    /// Extra unhashed files that need to be sent along with dist compiles.
+    pub extra_dist_files: Vec<PathBuf>,
     /// Extra files that need to have their contents hashed.
     pub extra_hash_files: Vec<PathBuf>,
     /// Whether or not the `-showIncludes` argument is passed on MSVC
@@ -116,7 +118,7 @@ pub struct ParsedArguments {
     /// arguments are incompatible with rewrite_includes_only
     pub suppress_rewrite_includes_only: bool,
     /// Arguments are incompatible with preprocessor cache mode
-    pub too_hard_for_preprocessor_cache_mode: bool,
+    pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
 }
 
 impl ParsedArguments {
@@ -151,8 +153,12 @@ pub enum CCompilerKind {
     Diab,
     /// Microsoft Visual C++
     Msvc,
-    /// NVIDIA cuda compiler
+    /// NVIDIA CUDA compiler
     Nvcc,
+    /// NVIDIA CUDA optimizer and PTX generator
+    Cicc,
+    /// NVIDIA CUDA PTX assembler
+    Ptxas,
     /// NVIDIA hpc c, c++ compiler
     Nvhpc,
     /// Tasking VX
@@ -173,6 +179,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         &self,
         arguments: &[OsString],
         cwd: &Path,
+        env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<ParsedArguments>;
     /// Run the C preprocessor with the specified set of arguments.
     #[allow(clippy::too_many_arguments)]
@@ -191,7 +198,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         T: CommandCreatorSync;
     /// Generate a command that can be used to invoke the C compiler to perform
     /// the compilation.
-    fn generate_compile_commands(
+    fn generate_compile_commands<T>(
         &self,
         path_transformer: &mut dist::PathTransformer,
         executable: &Path,
@@ -199,7 +206,13 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         rewrite_includes_only: bool,
-    ) -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)>;
+    ) -> Result<(
+        Box<dyn CompileCommand<T>>,
+        Option<dist::CompileCommand>,
+        Cacheable,
+    )>
+    where
+        T: CommandCreatorSync;
 }
 
 impl<I> CCompiler<I>
@@ -275,7 +288,7 @@ where
                     .map(|f| f.path())
                     .collect()
             })
-            .unwrap_or(Vec::default())
+            .unwrap_or_default()
     }
 }
 
@@ -296,7 +309,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        match self.compiler.parse_arguments(arguments, cwd) {
+        match self.compiler.parse_arguments(arguments, cwd, env_vars) {
             CompilerArguments::Ok(mut args) => {
                 // Handle SCCACHE_EXTRAFILES
                 for (k, v) in env_vars.iter() {
@@ -356,7 +369,7 @@ where
         rewrite_includes_only: bool,
         storage: Arc<dyn Storage>,
         cache_control: CacheControl,
-    ) -> Result<HashResult> {
+    ) -> Result<HashResult<T>> {
         let start_of_compilation = std::time::SystemTime::now();
         let CCompilerHasher {
             parsed_args,
@@ -382,7 +395,46 @@ where
         // Try to look for a cached preprocessing step for this compilation
         // request.
         let preprocessor_cache_mode_config = storage.preprocessor_cache_mode_config();
-        let mut preprocessor_key = if preprocessor_cache_mode_config.use_preprocessor_cache_mode {
+        let too_hard_for_preprocessor_cache_mode =
+            parsed_args.too_hard_for_preprocessor_cache_mode.is_some();
+        if let Some(arg) = &parsed_args.too_hard_for_preprocessor_cache_mode {
+            debug!(
+                "parse_arguments: Cannot use preprocessor cache because of {:?}",
+                arg
+            );
+        }
+
+        let use_preprocessor_cache_mode = {
+            let can_use_preprocessor_cache_mode = !may_dist
+                && preprocessor_cache_mode_config.use_preprocessor_cache_mode
+                && !too_hard_for_preprocessor_cache_mode;
+
+            let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
+
+            // Allow overrides from the env
+            for (key, val) in env_vars.iter() {
+                if key == "SCCACHE_DIRECT" {
+                    if let Some(val) = val.to_str() {
+                        use_preprocessor_cache_mode = match val.to_lowercase().as_str() {
+                            "false" | "off" | "0" => false,
+                            _ => can_use_preprocessor_cache_mode,
+                        };
+                    }
+                    break;
+                }
+            }
+
+            if can_use_preprocessor_cache_mode && !use_preprocessor_cache_mode {
+                debug!(
+                    "parse_arguments: Disabling preprocessor cache because SCCACHE_DIRECT=false"
+                );
+            }
+
+            use_preprocessor_cache_mode
+        };
+
+        // Disable preprocessor cache when doing distributed compilation
+        let mut preprocessor_key = if use_preprocessor_cache_mode {
             preprocessor_cache_entry_hash_key(
                 &executable_digest,
                 parsed_args.language,
@@ -398,8 +450,9 @@ where
         };
         if let Some(preprocessor_key) = &preprocessor_key {
             if cache_control == CacheControl::Default {
-                if let Some(mut seekable) =
-                    storage.get_preprocessor_cache_entry(preprocessor_key)?
+                if let Some(mut seekable) = storage
+                    .get_preprocessor_cache_entry(preprocessor_key)
+                    .await?
                 {
                     let mut buf = vec![];
                     seekable.read_to_end(&mut buf)?;
@@ -416,10 +469,13 @@ where
                             "Preprocessor cache updated because of time macros: {preprocessor_key}"
                         );
 
-                        if let Err(e) = storage.put_preprocessor_cache_entry(
-                            preprocessor_key,
-                            preprocessor_cache_entry,
-                        ) {
+                        if let Err(e) = storage
+                            .put_preprocessor_cache_entry(
+                                preprocessor_key,
+                                preprocessor_cache_entry,
+                            )
+                            .await
+                        {
                             debug!("Failed to update preprocessor cache: {}", e);
                             update_failed = true;
                         }
@@ -466,7 +522,7 @@ where
                 &env_vars,
                 may_dist,
                 rewrite_includes_only,
-                preprocessor_cache_mode_config.use_preprocessor_cache_mode,
+                use_preprocessor_cache_mode,
             )
             .await;
         let out_pretty = parsed_args.output_pretty().into_owned();
@@ -483,16 +539,14 @@ where
             debug!("removing files {:?}", &outputs);
 
             let v: std::result::Result<(), std::io::Error> =
-                outputs.values().fold(Ok(()), |r, output| {
-                    r.and_then(|_| {
-                        let mut path = args_cwd.clone();
-                        path.push(&output.path);
-                        match fs::metadata(&path) {
-                            // File exists, remove it.
-                            Ok(_) => fs::remove_file(&path),
-                            _ => Ok(()),
-                        }
-                    })
+                outputs.values().try_for_each(|output| {
+                    let mut path = args_cwd.clone();
+                    path.push(&output.path);
+                    match fs::metadata(&path) {
+                        // File exists, remove it.
+                        Ok(_) => fs::remove_file(&path),
+                        _ => Ok(()),
+                    }
                 });
             if v.is_err() {
                 warn!("Could not remove files after preprocessing failed!");
@@ -570,6 +624,7 @@ where
 
                 if let Err(e) = storage
                     .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)
+                    .await
                 {
                     debug!("Failed to update preprocessor cache: {}", e);
                 }
@@ -622,7 +677,7 @@ const INCBIN_DIRECTIVE: &[u8] = b".incbin";
 fn process_preprocessed_file(
     input_file: &Path,
     cwd: &Path,
-    bytes: &mut Vec<u8>,
+    bytes: &mut [u8],
     included_files: &mut HashMap<PathBuf, String>,
     config: PreprocessorCacheModeConfig,
     time_of_compilation: std::time::SystemTime,
@@ -1092,12 +1147,16 @@ fn include_is_too_new(
     false
 }
 
-impl<I: CCompilerImpl> Compilation for CCompilation<I> {
+impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
         rewrite_includes_only: bool,
-    ) -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)> {
+    ) -> Result<(
+        Box<dyn CompileCommand<T>>,
+        Option<dist::CompileCommand>,
+        Cacheable,
+    )> {
         let CCompilation {
             ref parsed_args,
             ref executable,
@@ -1106,6 +1165,7 @@ impl<I: CCompilerImpl> Compilation for CCompilation<I> {
             ref env_vars,
             ..
         } = *self;
+
         compiler.generate_compile_commands(
             path_transformer,
             executable,
@@ -1136,6 +1196,7 @@ impl<I: CCompilerImpl> Compilation for CCompilation<I> {
             input_path,
             preprocessed_input,
             path_transformer,
+            extra_dist_files: parsed_args.extra_dist_files,
             extra_hash_files: parsed_args.extra_hash_files,
         });
         let toolchain_packager = Box::new(CToolchainPackager {
@@ -1165,6 +1226,7 @@ struct CInputsPackager {
     input_path: PathBuf,
     path_transformer: dist::PathTransformer,
     preprocessed_input: Vec<u8>,
+    extra_dist_files: Vec<PathBuf>,
     extra_hash_files: Vec<PathBuf>,
 }
 
@@ -1175,6 +1237,7 @@ impl pkg::InputsPackager for CInputsPackager {
             input_path,
             mut path_transformer,
             preprocessed_input,
+            extra_dist_files,
             extra_hash_files,
         } = *self;
 
@@ -1192,8 +1255,8 @@ impl pkg::InputsPackager for CInputsPackager {
             builder.append(&file_header, preprocessed_input.as_slice())?;
         }
 
-        for input_path in extra_hash_files {
-            let input_path = pkg::simplify_path(&input_path)?;
+        for input_path in extra_hash_files.iter().chain(extra_dist_files.iter()) {
+            let input_path = pkg::simplify_path(input_path)?;
 
             if !super::CAN_DIST_DYLIBS
                 && input_path
@@ -1248,7 +1311,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         // files by path.
         let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
             let mut output = process::Command::new(&self.executable)
-                .arg(&format!("-print-{}-name={}", kind, name))
+                .arg(format!("-print-{}-name={}", kind, name))
                 .output()
                 .ok()?;
             debug!(
@@ -1321,6 +1384,10 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                 add_named_file(&mut package_builder, "specs")?;
                 add_named_file(&mut package_builder, "liblto_plugin.so")?;
             }
+
+            CCompilerKind::Cicc => {}
+
+            CCompilerKind::Ptxas => {}
 
             CCompilerKind::Nvcc => {
                 // Various programs called by the nvcc front end.
@@ -1430,6 +1497,42 @@ mod test {
         assert_neq!(
             hash_key("abcd", Language::C, &args, &[], &[], PREPROCESSED, false),
             hash_key("abcd", Language::C, &args, &[], &[], PREPROCESSED, true)
+        );
+    }
+
+    #[test]
+    fn test_header_differs() {
+        let args = ovec!["a", "b", "c"];
+        const PREPROCESSED: &[u8] = b"hello world";
+        assert_neq!(
+            hash_key("abcd", Language::C, &args, &[], &[], PREPROCESSED, false),
+            hash_key(
+                "abcd",
+                Language::CHeader,
+                &args,
+                &[],
+                &[],
+                PREPROCESSED,
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn test_plusplus_header_differs() {
+        let args = ovec!["a", "b", "c"];
+        const PREPROCESSED: &[u8] = b"hello world";
+        assert_neq!(
+            hash_key("abcd", Language::Cxx, &args, &[], &[], PREPROCESSED, true),
+            hash_key(
+                "abcd",
+                Language::CxxHeader,
+                &args,
+                &[],
+                &[],
+                PREPROCESSED,
+                true
+            )
         );
     }
 

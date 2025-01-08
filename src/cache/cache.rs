@@ -44,6 +44,7 @@ use crate::config::Config;
 use crate::config::{self, CacheType};
 use async_trait::async_trait;
 use fs_err as fs;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Cursor, Read, Seek, Write};
@@ -101,6 +102,8 @@ pub enum Cache {
     Hit(CacheRead),
     /// Result was not found in cache.
     Miss,
+    /// Do not cache the results of the compilation.
+    None,
     /// Cache entry should be ignored, force compilation.
     Recache,
 }
@@ -110,6 +113,7 @@ impl fmt::Debug for Cache {
         match *self {
             Cache::Hit(_) => write!(f, "Cache::Hit(...)"),
             Cache::Miss => write!(f, "Cache::Miss"),
+            Cache::None => write!(f, "Cache::None"),
             Cache::Recache => write!(f, "Cache::Recache"),
         }
     }
@@ -290,7 +294,12 @@ impl CacheWrite {
         self.zip
             .start_file(name, opts)
             .context("Failed to start cache entry object")?;
-        zstd::stream::copy_encode(from, &mut self.zip, 3)?;
+
+        let compression_level = std::env::var("SCCACHE_CACHE_ZSTD_LEVEL")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(3);
+        zstd::stream::copy_encode(from, &mut self.zip, compression_level)?;
         Ok(())
     }
 
@@ -375,7 +384,7 @@ pub trait Storage: Send + Sync {
     /// Return the preprocessor cache entry for a given preprocessor key,
     /// if it exists.
     /// Only applicable when using preprocessor cache mode.
-    fn get_preprocessor_cache_entry(
+    async fn get_preprocessor_cache_entry(
         &self,
         _key: &str,
     ) -> Result<Option<Box<dyn crate::lru_disk_cache::ReadSeek>>> {
@@ -384,7 +393,7 @@ pub trait Storage: Send + Sync {
     /// Insert a preprocessor cache entry at the given preprocessor key,
     /// overwriting the entry if it exists.
     /// Only applicable when using preprocessor cache mode.
-    fn put_preprocessor_cache_entry(
+    async fn put_preprocessor_cache_entry(
         &self,
         _key: &str,
         _preprocessor_cache_entry: PreprocessorCacheEntry,
@@ -459,7 +468,7 @@ impl Storage for opendal::Operator {
     async fn get(&self, key: &str) -> Result<Cache> {
         match self.read(&normalize_key(key)).await {
             Ok(res) => {
-                let hit = CacheRead::from(io::Cursor::new(res))?;
+                let hit = CacheRead::from(io::Cursor::new(res.to_bytes()))?;
                 Ok(Cache::Hit(hit))
             }
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(Cache::Miss),
@@ -784,6 +793,7 @@ mod test {
                 cache.put("test1", CacheWrite::default()).await.unwrap();
                 cache
                     .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
+                    .await
                     .unwrap();
             });
         }
@@ -806,6 +816,7 @@ mod test {
                 assert_eq!(
                     cache
                         .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
+                        .await
                         .unwrap_err()
                         .to_string(),
                     "Cannot write to a read-only cache"
